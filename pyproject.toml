@@ -1,0 +1,20 @@
+[project]
+name = "reposcribe-ai"
+version = "0.1.0"
+description = "Repository intelligence platform with Streamlit, RAG-ready indexing, and multi-provider LLM support."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic",
+    "chromadb",
+    "gitpython",
+    "google-generativeai",
+    "openai",
+    "pandas",
+    "python-dotenv",
+    "streamlit",
+]
+
+[tool.uv]
+package = false
+

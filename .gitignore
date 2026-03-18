@@ -1,0 +1,8 @@
+.env
+vector_store/
+repos/
+__pycache__/
+*.pyc
+.venv
+uv.lock
+
