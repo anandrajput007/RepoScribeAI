@@ -9,7 +9,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import streamlit as st
 
-from app.analyzer import RepoAnalyzer
+from app.analyzer import RepoAnalyzer, RepositoryAnalysis
 from app.code_parser import CodeParser, FileMetadata
 from app.doc_generator import DocumentationGenerator
 from app.llm_manager import LLMManager
@@ -24,13 +24,19 @@ APP_TITLE = "RepoScribe AI - Repository Intelligence Platform"
 def _initialize_state() -> None:
     defaults = {
         "analysis_result": None,
+        "active_repo_name": "",
         "selected_model": None,
         "chat_history": [],
         "show_missing_key_prompt": False,
         "missing_provider_name": "",
+        "show_delete_repo_prompt": False,
+        "repo_to_delete": "",
+        "show_add_repository_form": False,
+        "repo_limit_warning": "",
         "repo_url_input": "",
         "branch_cache_url": "",
         "branch_options": [],
+        "sidebar_section": "repository",
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -70,6 +76,31 @@ def _missing_key_dialog(provider_name: str, llm_manager: LLMManager, env_manager
             st.rerun()
 
 
+@st.dialog("Delete Repository")
+def _delete_repo_dialog(repo_name: str, analyzer: RepoAnalyzer) -> None:
+    st.write(f"Delete local repository `{repo_name}`?")
+    st.caption("This removes the downloaded files from the local `repos` folder.")
+
+    left_col, right_col = st.columns(2)
+    with left_col:
+        if st.button("Confirm Delete", use_container_width=True, type="primary"):
+            analyzer.repo_loader.delete_local_repository(repo_name)
+            current_analysis = st.session_state.get("analysis_result")
+            if current_analysis and current_analysis.load_result.repo_name == repo_name:
+                st.session_state["analysis_result"] = None
+            if st.session_state.get("active_repo_name") == repo_name:
+                st.session_state["active_repo_name"] = ""
+            st.session_state["show_delete_repo_prompt"] = False
+            st.session_state["repo_to_delete"] = ""
+            st.success("Repository deleted.")
+            st.rerun()
+    with right_col:
+        if st.button("Cancel", use_container_width=True):
+            st.session_state["show_delete_repo_prompt"] = False
+            st.session_state["repo_to_delete"] = ""
+            st.rerun()
+
+
 def _get_selected_file_metadata(file_index: list[FileMetadata], selected_path: str) -> FileMetadata | None:
     for item in file_index:
         if item.path == selected_path:
@@ -88,6 +119,70 @@ def _refresh_branch_options(repo_url: str, analyzer: RepoAnalyzer) -> None:
     st.session_state["branch_cache_url"] = repo_url.strip()
 
 
+def _set_active_analysis(result: RepositoryAnalysis) -> None:
+    st.session_state["analysis_result"] = result
+    st.session_state["active_repo_name"] = result.load_result.repo_name
+    st.session_state["chat_history"] = []
+
+
+def _get_active_repo_name(local_repo_names: list[str]) -> str:
+    current_active = st.session_state.get("active_repo_name", "")
+    if current_active in local_repo_names:
+        return current_active
+
+    current_analysis = st.session_state.get("analysis_result")
+    if current_analysis and current_analysis.load_result.repo_name in local_repo_names:
+        st.session_state["active_repo_name"] = current_analysis.load_result.repo_name
+        return current_analysis.load_result.repo_name
+
+    if len(local_repo_names) == 1:
+        st.session_state["active_repo_name"] = local_repo_names[0]
+        return local_repo_names[0]
+
+    return ""
+
+
+def _render_repo_card(repo, is_active: bool, analyzer: RepoAnalyzer) -> None:
+    bg_color = "#e9f7ef" if is_active else "#f3f4f6"
+    border_color = "#1f8f4d" if is_active else "#c7c9cf"
+    text_color = "#111827" if is_active else "#6b7280"
+    badge_bg = "#1f8f4d" if is_active else "#e5a50a"
+    badge_text = "Active" if is_active else "Inactive"
+
+    st.markdown(
+        f"""
+        <div style="background:{bg_color}; border:1px solid {border_color}; border-radius:14px; padding:0.8rem 0.9rem; margin-bottom:0.35rem;">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:0.75rem;">
+                <div style="font-weight:600; color:{text_color}; overflow-wrap:anywhere;">{repo.repo_name}</div>
+                <div style="background:{badge_bg}; color:white; padding:0.2rem 0.55rem; border-radius:999px; font-size:0.72rem; font-weight:600;">{badge_text}</div>
+            </div>
+            <div style="margin-top:0.4rem; color:{text_color}; font-size:0.92rem;">Branch: {repo.branch}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if is_active:
+        st.button("Active", key=f"active_{repo.repo_name}", use_container_width=True, type="primary", disabled=True)
+    else:
+        action_col, delete_col = st.columns([3, 1])
+        with action_col:
+            if st.button("Reactivate", key=f"reactivate_{repo.repo_name}", use_container_width=True):
+                try:
+                    _set_active_analysis(analyzer.load_existing_repository(repo.repo_name))
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+        with delete_col:
+            if st.button("X", key=f"delete_{repo.repo_name}", use_container_width=True, help="Delete local repository"):
+                st.session_state["repo_to_delete"] = repo.repo_name
+                st.session_state["show_delete_repo_prompt"] = True
+
+
+def _set_sidebar_section(section: str) -> None:
+    st.session_state["sidebar_section"] = section
+
+
 def main() -> None:
     ensure_directory(Path("repos"))
     ensure_directory(Path("vector_store"))
@@ -100,6 +195,20 @@ def main() -> None:
     doc_generator = DocumentationGenerator()
 
     st.set_page_config(page_title="RepoScribe AI", layout="wide")
+    st.markdown(
+        """
+        <style>
+        section[data-testid="stSidebar"] {
+            width: 24rem !important;
+            min-width: 24rem !important;
+        }
+        section[data-testid="stSidebar"] > div {
+            width: 24rem !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.title(APP_TITLE)
 
     configured_models = llm_manager.get_configured_models()
@@ -113,87 +222,92 @@ def main() -> None:
 
     local_repositories = analyzer.repo_loader.list_local_repositories()
     local_repo_names = [repo.repo_name for repo in local_repositories]
+    active_repo_name = _get_active_repo_name(local_repo_names)
 
     with st.sidebar:
-        with st.expander("Repository Control", expanded=True):
-            st.caption(f"Local repositories: {len(local_repositories)}/{analyzer.repo_loader.max_repositories}")
-            if len(local_repositories) >= analyzer.repo_loader.max_repositories:
-                st.warning("Already 3 repositories are downloaded. Remove one before processing a new repository.")
+        repo_open = st.session_state.get("sidebar_section") == "repository"
+        model_open = st.session_state.get("sidebar_section") == "model"
 
-            selected_local_repo = st.selectbox(
-                "Select local repository",
-                [""] + local_repo_names,
-                key="selected_local_repo",
-            )
-            selected_local_info = next(
-                (repo for repo in local_repositories if repo.repo_name == selected_local_repo),
-                None,
-            )
-            if selected_local_info:
-                st.caption(f"Branch: {selected_local_info.branch}")
-                st.caption(f"URL: {selected_local_info.repo_url}")
+        if st.button(
+            f"{'▼' if repo_open else '▶'} Repository ({len(local_repositories)}/{analyzer.repo_loader.max_repositories})",
+            key="sidebar_repository_toggle",
+            use_container_width=True,
+        ):
+            _set_sidebar_section("repository")
 
-            open_col, delete_col = st.columns(2)
-            with open_col:
-                if st.button("Open Local", use_container_width=True):
-                    if selected_local_repo:
-                        try:
-                            st.session_state["analysis_result"] = analyzer.load_existing_repository(selected_local_repo)
-                            st.success("Local repository loaded.")
-                        except Exception as exc:
-                            st.error(str(exc))
-            with delete_col:
-                if st.button("Delete Local", use_container_width=True):
-                    if selected_local_repo:
-                        analyzer.repo_loader.delete_local_repository(selected_local_repo)
-                        current_analysis = st.session_state.get("analysis_result")
-                        if current_analysis and current_analysis.load_result.repo_name == selected_local_repo:
-                            st.session_state["analysis_result"] = None
-                        st.success("Local repository deleted.")
+        if repo_open:
+            if st.session_state.get("repo_limit_warning"):
+                st.warning(st.session_state["repo_limit_warning"])
+                st.session_state["repo_limit_warning"] = ""
+
+            for repo in local_repositories:
+                _render_repo_card(repo, repo.repo_name == active_repo_name, analyzer)
+
+            if st.button("+ Add Repository", use_container_width=True, type="primary"):
+                if len(local_repositories) >= analyzer.repo_loader.max_repositories:
+                    st.session_state["repo_limit_warning"] = "Need to remove one repository then load a new repository."
+                else:
+                    st.session_state["show_add_repository_form"] = True
+                st.rerun()
+
+            if st.session_state.get("show_add_repository_form"):
+                st.divider()
+                repo_url = st.text_input("Repository URL", key="repo_url_input")
+                fetch_col, process_col = st.columns(2)
+                with fetch_col:
+                    if st.button("Load Branches", use_container_width=True):
+                        if repo_url.strip():
+                            try:
+                                _refresh_branch_options(repo_url, analyzer)
+                                if not st.session_state["branch_options"]:
+                                    st.warning("No branches were found for this repository.")
+                            except Exception as exc:
+                                st.error(str(exc))
+                        else:
+                            st.warning("Enter a repository URL first.")
+
+                branch_options = (
+                    st.session_state.get("branch_options", [])
+                    if st.session_state.get("branch_cache_url") == repo_url.strip()
+                    else []
+                )
+                if branch_options:
+                    default_branch_index = branch_options.index("main") if "main" in branch_options else 0
+                    selected_branch = st.selectbox("Select branch", branch_options, index=default_branch_index)
+                else:
+                    selected_branch = st.text_input("Branch", value="main", key="branch_text_input")
+
+                process_now_col, cancel_col = st.columns(2)
+                with process_now_col:
+                    if st.button("Process Repository", use_container_width=True):
+                        if not repo_url.strip():
+                            st.warning("Enter a repository URL first.")
+                        else:
+                            try:
+                                with st.spinner("Processing repository..."):
+                                    result = analyzer.process_repository(
+                                        repo_url.strip(),
+                                        branch=selected_branch,
+                                    )
+                                _set_active_analysis(result)
+                                st.session_state["show_add_repository_form"] = False
+                                st.success("Repository processed successfully.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(str(exc))
+                with cancel_col:
+                    if st.button("Close", use_container_width=True):
+                        st.session_state["show_add_repository_form"] = False
                         st.rerun()
 
-            st.divider()
-            repo_url = st.text_input("Repository URL", key="repo_url_input")
-            fetch_col, process_col = st.columns(2)
-            with fetch_col:
-                if st.button("Load Branches", use_container_width=True):
-                    if repo_url.strip():
-                        try:
-                            _refresh_branch_options(repo_url, analyzer)
-                            if not st.session_state["branch_options"]:
-                                st.warning("No branches were found for this repository.")
-                        except Exception as exc:
-                            st.error(str(exc))
-                    else:
-                        st.warning("Enter a repository URL first.")
+        if st.button(
+            f"{'▼' if model_open else '▶'} Model Selection",
+            key="sidebar_model_toggle",
+            use_container_width=True,
+        ):
+            _set_sidebar_section("model")
 
-            branch_options = (
-                st.session_state.get("branch_options", [])
-                if st.session_state.get("branch_cache_url") == repo_url.strip()
-                else []
-            )
-            if branch_options:
-                default_branch_index = branch_options.index("main") if "main" in branch_options else 0
-                selected_branch = st.selectbox("Select branch", branch_options, index=default_branch_index)
-            else:
-                selected_branch = st.text_input("Branch", value="main", key="branch_text_input")
-
-            with process_col:
-                if st.button("Process Repository", use_container_width=True):
-                    if not repo_url.strip():
-                        st.warning("Enter a repository URL first.")
-                    else:
-                        try:
-                            with st.spinner("Processing repository..."):
-                                st.session_state["analysis_result"] = analyzer.process_repository(
-                                    repo_url.strip(),
-                                    branch=selected_branch,
-                                )
-                            st.success("Repository processed successfully.")
-                        except Exception as exc:
-                            st.error(str(exc))
-
-        with st.expander("Model Selection", expanded=True):
+        if model_open:
             if configured_labels:
                 selected_index = configured_labels.index(st.session_state["selected_model"]) if st.session_state["selected_model"] in configured_labels else 0
                 selected_model = st.selectbox("Select AI Model", configured_labels, index=selected_index)
@@ -216,6 +330,9 @@ def main() -> None:
     if st.session_state.get("show_missing_key_prompt"):
         _missing_key_dialog(st.session_state.get("missing_provider_name", ""), llm_manager, env_manager)
 
+    if st.session_state.get("show_delete_repo_prompt") and st.session_state.get("repo_to_delete"):
+        _delete_repo_dialog(st.session_state["repo_to_delete"], analyzer)
+
     ask_tab, explain_tab, settings_tab = st.tabs(
         ["Ask Questions", "File / Method Explanation", "Settings"]
     )
@@ -224,7 +341,7 @@ def main() -> None:
         st.subheader("Ask Questions")
         analysis_result = st.session_state.get("analysis_result")
         if not analysis_result:
-            st.info("Process or open a repository from the sidebar to enable repository Q&A.")
+            st.info("Process or reactivate a repository from the sidebar to enable repository Q&A.")
         else:
             question = st.chat_input("Ask a question about the repository")
             if question:
@@ -239,7 +356,7 @@ def main() -> None:
                     )
                     st.session_state["chat_history"].append({"question": question, "answer": answer})
 
-            for item in st.session_state["chat_history"]:
+            for item in reversed(st.session_state["chat_history"]):
                 with st.chat_message("user"):
                     st.write(item["question"])
                 with st.chat_message("assistant"):
@@ -255,7 +372,7 @@ def main() -> None:
         st.subheader("File / Method Explanation")
         analysis_result = st.session_state.get("analysis_result")
         if not analysis_result or not analysis_result.file_index:
-            st.info("Process or open a repository to inspect files and methods.")
+            st.info("Process or reactivate a repository to inspect files and methods.")
         else:
             file_options = [item.path for item in analysis_result.file_index]
             left_col, right_col = st.columns(2)
