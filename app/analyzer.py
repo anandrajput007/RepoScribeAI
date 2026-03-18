@@ -27,8 +27,8 @@ class RepoAnalyzer:
         self.code_parser = code_parser or CodeParser()
         self.rag_engine = rag_engine or RAGEngine()
 
-    def process_repository(self, repo_url: str) -> RepositoryAnalysis:
-        load_result = self.repo_loader.clone_or_get_repo(repo_url)
+    def process_repository(self, repo_url: str, branch: str | None = None) -> RepositoryAnalysis:
+        load_result = self.repo_loader.clone_or_get_repo(repo_url, branch=branch)
         file_index = self.code_parser.build_file_index(load_result.local_path)
         chunks = self.rag_engine.chunk_codebase(load_result.local_path, file_index)
         embeddings = self.rag_engine.create_embeddings(chunks)
@@ -51,3 +51,26 @@ class RepoAnalyzer:
         file_path = Path(repo_path) / relative_file_path
         return file_path.read_text(encoding="utf-8", errors="ignore")
 
+    def load_existing_repository(self, repo_name: str) -> RepositoryAnalysis:
+        local_repositories = self.repo_loader.list_local_repositories()
+        selected_repo = next((repo for repo in local_repositories if repo.repo_name == repo_name), None)
+        if not selected_repo:
+            raise RuntimeError("Selected repository was not found locally.")
+
+        file_index = self.code_parser.build_file_index(selected_repo.local_path)
+        chunks = self.rag_engine.chunk_codebase(selected_repo.local_path, file_index)
+        embeddings = self.rag_engine.create_embeddings(chunks)
+        self.rag_engine.store_vectors(chunks, embeddings)
+
+        return RepositoryAnalysis(
+            load_result=RepoLoadResult(
+                repo_name=selected_repo.repo_name,
+                repo_url=selected_repo.repo_url,
+                local_path=selected_repo.local_path,
+                branch=selected_repo.branch,
+                cloned=False,
+                message="Loaded repository from local storage.",
+            ),
+            file_index=file_index,
+            chunk_count=len(chunks),
+        )

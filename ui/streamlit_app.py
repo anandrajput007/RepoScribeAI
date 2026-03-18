@@ -18,7 +18,7 @@ from utils.env_manager import ENV_KEY_LABELS, EnvManager
 from utils.file_utils import ensure_directory
 
 
-APP_TITLE = "RepoScribe AI — Repository Intelligence Platform"
+APP_TITLE = "RepoScribe AI - Repository Intelligence Platform"
 
 
 def _initialize_state() -> None:
@@ -27,29 +27,44 @@ def _initialize_state() -> None:
         "selected_model": None,
         "chat_history": [],
         "show_missing_key_prompt": False,
-        "missing_model_label": "",
+        "missing_provider_name": "",
+        "repo_url_input": "",
+        "branch_cache_url": "",
+        "branch_options": [],
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
 
 
 @st.dialog("Configure Provider API Key")
-def _missing_key_dialog(model_label: str, llm_manager: LLMManager, env_manager: EnvManager) -> None:
-    model = llm_manager.get_model_by_label(model_label)
-    if not model:
-        st.write("No model metadata found.")
+def _missing_key_dialog(provider_name: str, llm_manager: LLMManager, env_manager: EnvManager) -> None:
+    provider = llm_manager.get_provider_by_name(provider_name)
+    if not provider:
+        st.write("No provider metadata found.")
         return
 
-    st.write(f"{model.label} requires an API key before it can be used.")
-    api_key = st.text_input(ENV_KEY_LABELS[model.env_key], type="password")
-    col1, col2 = st.columns(2)
-    with col1:
+    current_model = llm_manager.get_provider_model(provider)
+    st.write(f"{provider.provider} requires an API key before it can be used.")
+    api_key = st.text_input(ENV_KEY_LABELS[provider.env_key], type="password")
+    model_choice = st.selectbox(
+        f"{provider.provider} Base Model",
+        provider.available_models,
+        index=provider.available_models.index(current_model) if current_model in provider.available_models else 0,
+    )
+
+    left_col, right_col = st.columns(2)
+    with left_col:
         if st.button("Save Key", use_container_width=True):
             if api_key.strip():
-                env_manager.save_key(model.env_key, api_key.strip())
+                env_manager.save_keys(
+                    {
+                        provider.env_key: api_key.strip(),
+                        provider.model_env_key: model_choice,
+                    }
+                )
                 st.session_state["show_missing_key_prompt"] = False
                 st.rerun()
-    with col2:
+    with right_col:
         if st.button("Cancel", use_container_width=True):
             st.session_state["show_missing_key_prompt"] = False
             st.rerun()
@@ -60,6 +75,17 @@ def _get_selected_file_metadata(file_index: list[FileMetadata], selected_path: s
         if item.path == selected_path:
             return item
     return None
+
+
+def _refresh_branch_options(repo_url: str, analyzer: RepoAnalyzer) -> None:
+    if not repo_url.strip():
+        st.session_state["branch_options"] = []
+        st.session_state["branch_cache_url"] = ""
+        return
+
+    branches = analyzer.repo_loader.get_remote_branches(repo_url.strip())
+    st.session_state["branch_options"] = branches
+    st.session_state["branch_cache_url"] = repo_url.strip()
 
 
 def main() -> None:
@@ -77,41 +103,118 @@ def main() -> None:
     st.title(APP_TITLE)
 
     configured_models = llm_manager.get_configured_models()
-    configured_labels = [model.label for model in configured_models]
-    all_labels = [model.label for model in llm_manager.SUPPORTED_MODELS]
+    configured_labels = [model.display_label for model in configured_models]
+    default_model = llm_manager.get_default_model_label()
+    if configured_labels and default_model not in configured_labels:
+        default_model = configured_labels[0]
+        llm_manager.save_default_model_label(default_model)
+    if configured_labels and st.session_state.get("selected_model") not in configured_labels:
+        st.session_state["selected_model"] = default_model or configured_labels[0]
+
+    local_repositories = analyzer.repo_loader.list_local_repositories()
+    local_repo_names = [repo.repo_name for repo in local_repositories]
 
     with st.sidebar:
-        st.header("Repository Controls")
-        repo_url = st.text_input("Repository URL")
-        if st.button("Process Repository", use_container_width=True):
-            if not repo_url.strip():
-                st.warning("Enter a repository URL first.")
+        with st.expander("Repository Control", expanded=True):
+            st.caption(f"Local repositories: {len(local_repositories)}/{analyzer.repo_loader.max_repositories}")
+            if len(local_repositories) >= analyzer.repo_loader.max_repositories:
+                st.warning("Already 3 repositories are downloaded. Remove one before processing a new repository.")
+
+            selected_local_repo = st.selectbox(
+                "Select local repository",
+                [""] + local_repo_names,
+                key="selected_local_repo",
+            )
+            selected_local_info = next(
+                (repo for repo in local_repositories if repo.repo_name == selected_local_repo),
+                None,
+            )
+            if selected_local_info:
+                st.caption(f"Branch: {selected_local_info.branch}")
+                st.caption(f"URL: {selected_local_info.repo_url}")
+
+            open_col, delete_col = st.columns(2)
+            with open_col:
+                if st.button("Open Local", use_container_width=True):
+                    if selected_local_repo:
+                        try:
+                            st.session_state["analysis_result"] = analyzer.load_existing_repository(selected_local_repo)
+                            st.success("Local repository loaded.")
+                        except Exception as exc:
+                            st.error(str(exc))
+            with delete_col:
+                if st.button("Delete Local", use_container_width=True):
+                    if selected_local_repo:
+                        analyzer.repo_loader.delete_local_repository(selected_local_repo)
+                        current_analysis = st.session_state.get("analysis_result")
+                        if current_analysis and current_analysis.load_result.repo_name == selected_local_repo:
+                            st.session_state["analysis_result"] = None
+                        st.success("Local repository deleted.")
+                        st.rerun()
+
+            st.divider()
+            repo_url = st.text_input("Repository URL", key="repo_url_input")
+            fetch_col, process_col = st.columns(2)
+            with fetch_col:
+                if st.button("Load Branches", use_container_width=True):
+                    if repo_url.strip():
+                        try:
+                            _refresh_branch_options(repo_url, analyzer)
+                            if not st.session_state["branch_options"]:
+                                st.warning("No branches were found for this repository.")
+                        except Exception as exc:
+                            st.error(str(exc))
+                    else:
+                        st.warning("Enter a repository URL first.")
+
+            branch_options = (
+                st.session_state.get("branch_options", [])
+                if st.session_state.get("branch_cache_url") == repo_url.strip()
+                else []
+            )
+            if branch_options:
+                default_branch_index = branch_options.index("main") if "main" in branch_options else 0
+                selected_branch = st.selectbox("Select branch", branch_options, index=default_branch_index)
             else:
-                with st.spinner("Processing repository..."):
-                    try:
-                        st.session_state["analysis_result"] = analyzer.process_repository(repo_url.strip())
-                        st.success("Repository processed successfully.")
-                    except Exception as exc:
-                        st.error(str(exc))
+                selected_branch = st.text_input("Branch", value="main", key="branch_text_input")
 
-        st.divider()
-        st.subheader("Model Selection")
-        selection_source = configured_labels if configured_labels else ["No configured models"]
-        selected_label = st.selectbox("Select AI Model", selection_source)
-        st.session_state["selected_model"] = selected_label if selected_label != "No configured models" else None
+            with process_col:
+                if st.button("Process Repository", use_container_width=True):
+                    if not repo_url.strip():
+                        st.warning("Enter a repository URL first.")
+                    else:
+                        try:
+                            with st.spinner("Processing repository..."):
+                                st.session_state["analysis_result"] = analyzer.process_repository(
+                                    repo_url.strip(),
+                                    branch=selected_branch,
+                                )
+                            st.success("Repository processed successfully.")
+                        except Exception as exc:
+                            st.error(str(exc))
 
-        missing_option = st.selectbox("Add or inspect provider", all_labels, index=0 if all_labels else None)
-        if missing_option and not llm_manager.is_model_configured(missing_option):
-            if st.button("Configure Selected Provider", use_container_width=True):
-                st.session_state["missing_model_label"] = missing_option
-                st.session_state["show_missing_key_prompt"] = True
+        with st.expander("Model Selection", expanded=True):
+            if configured_labels:
+                selected_index = configured_labels.index(st.session_state["selected_model"]) if st.session_state["selected_model"] in configured_labels else 0
+                selected_model = st.selectbox("Select AI Model", configured_labels, index=selected_index)
+                st.session_state["selected_model"] = selected_model
+                llm_manager.save_default_model_label(selected_model)
+            else:
+                st.info("No configured providers yet.")
 
-        st.divider()
-        st.caption("Navigation")
-        st.write("Use the tabs in the main area.")
+            provider_names = [provider.provider for provider in llm_manager.get_provider_configs()]
+            provider_to_configure = st.selectbox("Configure provider", provider_names, key="provider_to_configure")
+            if not llm_manager.is_provider_configured(provider_to_configure):
+                if st.button("Add Provider Key", use_container_width=True):
+                    st.session_state["missing_provider_name"] = provider_to_configure
+                    st.session_state["show_missing_key_prompt"] = True
+            else:
+                st.caption("Provider configured. Change base model from Settings.")
+
+        st.caption("Use the tabs in the main area.")
 
     if st.session_state.get("show_missing_key_prompt"):
-        _missing_key_dialog(st.session_state.get("missing_model_label", ""), llm_manager, env_manager)
+        _missing_key_dialog(st.session_state.get("missing_provider_name", ""), llm_manager, env_manager)
 
     ask_tab, explain_tab, settings_tab = st.tabs(
         ["Ask Questions", "File / Method Explanation", "Settings"]
@@ -121,7 +224,7 @@ def main() -> None:
         st.subheader("Ask Questions")
         analysis_result = st.session_state.get("analysis_result")
         if not analysis_result:
-            st.info("Process a repository from the sidebar to enable repository Q&A.")
+            st.info("Process or open a repository from the sidebar to enable repository Q&A.")
         else:
             question = st.chat_input("Ask a question about the repository")
             if question:
@@ -152,7 +255,7 @@ def main() -> None:
         st.subheader("File / Method Explanation")
         analysis_result = st.session_state.get("analysis_result")
         if not analysis_result or not analysis_result.file_index:
-            st.info("Process a repository to inspect files and methods.")
+            st.info("Process or open a repository to inspect files and methods.")
         else:
             file_options = [item.path for item in analysis_result.file_index]
             left_col, right_col = st.columns(2)
@@ -186,7 +289,7 @@ def main() -> None:
                     st.text(generated["acceptance_criteria"])
 
     with settings_tab:
-        render_settings_page(env_manager)
+        render_settings_page(env_manager, llm_manager)
 
 
 if __name__ == "__main__":

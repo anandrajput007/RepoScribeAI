@@ -12,6 +12,15 @@ ENV_KEY_LABELS = {
     "COPILOT_API_KEY": "Copilot API Key",
 }
 
+MODEL_ENV_KEY_LABELS = {
+    "OPENAI_MODEL": "OpenAI Base Model",
+    "GEMINI_MODEL": "Gemini Base Model",
+    "ANTHROPIC_MODEL": "Claude Base Model",
+    "COPILOT_MODEL": "Copilot Base Model",
+}
+
+DEFAULT_MODEL_ENV_KEY = "DEFAULT_MODEL_LABEL"
+
 
 class EnvManager:
     def __init__(self, env_path: str | Path = ".env") -> None:
@@ -30,3 +39,5 @@ class EnvManager:
         for key, value in values.items():
             self.save_key(key, value)
 
+    def get_value(self, key: str, default: str = "") -> str:
+        return self.load_env().get(key, default)
